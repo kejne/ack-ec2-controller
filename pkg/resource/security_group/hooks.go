@@ -16,12 +16,13 @@ package security_group
 import (
 	"context"
 
-	svcapitypes "github.com/aws-controllers-k8s/ec2-controller/apis/v1alpha1"
-
 	ackcompare "github.com/aws-controllers-k8s/runtime/pkg/compare"
 	ackrtlog "github.com/aws-controllers-k8s/runtime/pkg/runtime/log"
 	awserr "github.com/aws/aws-sdk-go/aws/awserr"
 	svcsdk "github.com/aws/aws-sdk-go/service/ec2"
+
+	svcapitypes "github.com/aws-controllers-k8s/ec2-controller/apis/v1alpha1"
+	"github.com/aws-controllers-k8s/ec2-controller/pkg/tags"
 )
 
 // addRulesToSpec updates a resource's Spec EgressRules and IngressRules
@@ -157,105 +158,6 @@ func (rm *resourceManager) syncSGRules(
 	return nil
 }
 
-// syncTags used to keep tags in sync by calling Create and Delete Tags API's
-func (rm *resourceManager) syncTags(
-	ctx context.Context,
-	desired *resource,
-	latest *resource,
-) (err error) {
-	rlog := ackrtlog.FromContext(ctx)
-	exit := rlog.Trace("rm.syncTags")
-	defer func(err error) {
-		exit(err)
-	}(err)
-
-	resourceId := []*string{latest.ko.Status.ID}
-
-	toAdd, toDelete := computeTagsDelta(
-		desired.ko.Spec.Tags, latest.ko.Spec.Tags,
-	)
-
-	if len(toDelete) > 0 {
-		rlog.Debug("removing tags from security group resource", "tags", toDelete)
-		_, err = rm.sdkapi.DeleteTagsWithContext(
-			ctx,
-			&svcsdk.DeleteTagsInput{
-				Resources: resourceId,
-				Tags:      rm.sdkTags(toDelete),
-			},
-		)
-		rm.metrics.RecordAPICall("UPDATE", "DeleteTags", err)
-		if err != nil {
-			return err
-		}
-
-	}
-
-	if len(toAdd) > 0 {
-		rlog.Debug("adding tags to security group resource", "tags", toAdd)
-		_, err = rm.sdkapi.CreateTagsWithContext(
-			ctx,
-			&svcsdk.CreateTagsInput{
-				Resources: resourceId,
-				Tags:      rm.sdkTags(toAdd),
-			},
-		)
-		rm.metrics.RecordAPICall("UPDATE", "CreateTags", err)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// sdkTags converts *svcapitypes.Tag array to a *svcsdk.Tag array
-func (rm *resourceManager) sdkTags(
-	tags []*svcapitypes.Tag,
-) (sdktags []*svcsdk.Tag) {
-
-	for _, i := range tags {
-		sdktag := rm.newTag(*i)
-		sdktags = append(sdktags, sdktag)
-	}
-
-	return sdktags
-}
-
-// computeTagsDelta returns tags to be added and removed from the resource
-func computeTagsDelta(
-	desired []*svcapitypes.Tag,
-	latest []*svcapitypes.Tag,
-) (toAdd []*svcapitypes.Tag, toDelete []*svcapitypes.Tag) {
-
-	desiredTags := map[string]string{}
-	for _, tag := range desired {
-		desiredTags[*tag.Key] = *tag.Value
-	}
-
-	latestTags := map[string]string{}
-	for _, tag := range latest {
-		latestTags[*tag.Key] = *tag.Value
-	}
-
-	for _, tag := range desired {
-		val, ok := latestTags[*tag.Key]
-		if !ok || val != *tag.Value {
-			toAdd = append(toAdd, tag)
-		}
-	}
-
-	for _, tag := range latest {
-		_, ok := desiredTags[*tag.Key]
-		if !ok {
-			toDelete = append(toDelete, tag)
-		}
-	}
-
-	return toAdd, toDelete
-
-}
-
 // updateTagSpecificationsInCreateRequest adds
 // Tags defined in the Spec to CreateSecurityGroupInput.TagSpecification
 // and ensures the ResourceType is always set to 'security-group'
@@ -296,6 +198,18 @@ func (rm *resourceManager) createSecurityGroupRules(
 	// Authorize ingress rules
 	for _, i := range ingress {
 		ipInput := rm.newIPPermission(*i)
+		for _, userIDGroupPair := range ipInput.UserIdGroupPairs {
+			// If not provided, we need to default the VPC and SecurityGroup IDs.
+			//
+			// The newIPPermission function doesn't return nil UserIdGroupPair items. It is safe to
+			// access them here.
+			if userIDGroupPair.GroupId == nil && userIDGroupPair.GroupName == nil {
+				userIDGroupPair.GroupId = r.ko.Status.ID
+			}
+			if userIDGroupPair.VpcId == nil {
+				userIDGroupPair.VpcId = r.ko.Spec.VPCID
+			}
+		}
 		req := &svcsdk.AuthorizeSecurityGroupIngressInput{
 			GroupId:       r.ko.Status.ID,
 			IpPermissions: []*svcsdk.IpPermission{ipInput},
@@ -311,6 +225,18 @@ func (rm *resourceManager) createSecurityGroupRules(
 	// Authorize egress rules
 	for _, e := range egress {
 		ipInput := rm.newIPPermission(*e)
+		for _, userIDGroupPair := range ipInput.UserIdGroupPairs {
+			// If not provided, we need to default the security group ID and vpc ID.
+			//
+			// The newIPPermission function doesn't return nil UserIdGroupPair items. It is safe to
+			// access them here.
+			if userIDGroupPair.GroupId == nil && userIDGroupPair.GroupName == nil {
+				userIDGroupPair.GroupId = r.ko.Status.ID
+			}
+			if userIDGroupPair.VpcId == nil {
+				userIDGroupPair.VpcId = r.ko.Spec.VPCID
+			}
+		}
 		req := &svcsdk.AuthorizeSecurityGroupEgressInput{
 			GroupId:       r.ko.Status.ID,
 			IpPermissions: []*svcsdk.IpPermission{ipInput},
@@ -445,29 +371,15 @@ func (rm *resourceManager) customUpdateSecurityGroup(
 	}
 
 	if delta.DifferentAt("Spec.Tags") {
-		if err := rm.syncTags(ctx, desired, latest); err != nil {
+		if err := tags.Sync(
+			ctx, rm.sdkapi, rm.metrics, *latest.ko.Status.ID,
+			desired.ko.Spec.Tags, latest.ko.Spec.Tags,
+		); err != nil {
 			return nil, err
 		}
 	}
 
 	return updated, nil
-}
-
-// compareTags is a custom comparison function for comparing lists of Tag
-// structs where the order of the structs in the list is not important.
-func compareTags(
-	delta *ackcompare.Delta,
-	a *resource,
-	b *resource,
-) {
-	if len(a.ko.Spec.Tags) != len(b.ko.Spec.Tags) {
-		delta.Add("Spec.Tags", a.ko.Spec.Tags, b.ko.Spec.Tags)
-	} else if len(a.ko.Spec.Tags) > 0 {
-		addedOrUpdated, removed := computeTagsDelta(a.ko.Spec.Tags, b.ko.Spec.Tags)
-		if len(addedOrUpdated) != 0 || len(removed) != 0 {
-			delta.Add("Spec.Tags", a.ko.Spec.Tags, b.ko.Spec.Tags)
-		}
-	}
 }
 
 // containsRule returns true if security group rule

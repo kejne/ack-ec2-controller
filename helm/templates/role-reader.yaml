@@ -23,6 +23,8 @@ rules:
   - transitgateways
   - vpcs
   - vpcendpoints
+  - vpcendpointserviceconfigurations
+  - vpcpeeringconnections
   verbs:
   - get
   - list

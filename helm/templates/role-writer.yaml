@@ -10,33 +10,23 @@ rules:
   - ec2.services.k8s.aws
   resources:
   - dhcpoptions
-
   - elasticipaddresses
-
   - flowlogs
-
   - instances
-
   - internetgateways
 
   - launchtemplates
 
   - natgateways
-
   - networkacls
-
   - routetables
-
   - securitygroups
-
   - subnets
-
   - transitgateways
-
   - vpcs
-
   - vpcendpoints
-
+  - vpcendpointserviceconfigurations
+  - vpcpeeringconnections
   verbs:
   - create
   - delete
@@ -62,6 +52,8 @@ rules:
   - transitgateways
   - vpcs
   - vpcendpoints
+  - vpcendpointserviceconfigurations
+  - vpcpeeringconnections
   verbs:
   - get
   - patch
